@@ -115,10 +115,8 @@ pub(crate) fn start_demuxer_task(
             .await
         })
     } else {
-        use log::info;
         // There could be an arbitrarily large number of parallel hive style partitions being written to, so we cannot
         // bound this channel without risking a deadlock.
-        info!("config.original_url: {}", config.original_url);
         let partition_by = config.table_partition_cols.clone();
         let keep_partition_by_columns = config.keep_partition_by_columns;
         SpawnedTask::spawn(async move {
