@@ -273,13 +273,6 @@ impl Unparser<'_> {
                 pattern,
                 escape_char,
                 case_insensitive: _,
-            })
-            | Expr::Like(Like {
-                negated,
-                expr,
-                pattern,
-                escape_char,
-                case_insensitive: _,
             }) => Ok(ast::Expr::Like {
                 negated: *negated,
                 expr: Box::new(self.expr_to_sql_inner(expr)?),
@@ -287,12 +280,39 @@ impl Unparser<'_> {
                 escape_char: escape_char.map(|c| c.to_string()),
                 any: false,
             }),
+            Expr::Like(Like {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+                case_insensitive,
+            }) => {
+                if *case_insensitive {
+                    Ok(ast::Expr::ILike {
+                        negated: *negated,
+                        expr: Box::new(self.expr_to_sql_inner(expr)?),
+                        pattern: Box::new(self.expr_to_sql_inner(pattern)?),
+                        escape_char: escape_char.map(|c| c.to_string()),
+                        any: false,
+                    })
+                } else {
+                    Ok(ast::Expr::Like {
+                        negated: *negated,
+                        expr: Box::new(self.expr_to_sql_inner(expr)?),
+                        pattern: Box::new(self.expr_to_sql_inner(pattern)?),
+                        escape_char: escape_char.map(|c| c.to_string()),
+                        any: false,
+                    })
+                }
+            }
+
             Expr::AggregateFunction(agg) => {
                 let func_name = agg.func.name();
                 let AggregateFunctionParams {
                     distinct,
                     args,
                     filter,
+                    order_by,
                     ..
                 } = &agg.params;
 
@@ -300,6 +320,16 @@ impl Unparser<'_> {
                 let filter = match filter {
                     Some(filter) => Some(Box::new(self.expr_to_sql_inner(filter)?)),
                     None => None,
+                };
+                let within_group = if agg.func.is_ordered_set_aggregate() {
+                    order_by
+                        .as_ref()
+                        .unwrap_or(&Vec::new())
+                        .iter()
+                        .map(|sort_expr| self.sort_to_sql(sort_expr))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    Vec::new()
                 };
                 Ok(ast::Expr::Function(Function {
                     name: ObjectName::from(vec![Ident {
@@ -316,7 +346,7 @@ impl Unparser<'_> {
                     filter,
                     null_treatment: None,
                     over: None,
-                    within_group: vec![],
+                    within_group,
                     parameters: ast::FunctionArguments::None,
                     uses_odbc_syntax: false,
                 }))
@@ -925,6 +955,19 @@ impl Unparser<'_> {
             BinaryOperator::StringConcat => Ok(Operator::StringConcat),
             BinaryOperator::AtArrow => Ok(Operator::AtArrow),
             BinaryOperator::ArrowAt => Ok(Operator::ArrowAt),
+            BinaryOperator::Arrow => Ok(Operator::Arrow),
+            BinaryOperator::LongArrow => Ok(Operator::LongArrow),
+            BinaryOperator::HashArrow => Ok(Operator::HashArrow),
+            BinaryOperator::HashLongArrow => Ok(Operator::HashLongArrow),
+            BinaryOperator::AtAt => Ok(Operator::AtAt),
+            BinaryOperator::DuckIntegerDivide | BinaryOperator::MyIntegerDivide => {
+                Ok(Operator::IntegerDivide)
+            }
+            BinaryOperator::HashMinus => Ok(Operator::HashMinus),
+            BinaryOperator::AtQuestion => Ok(Operator::AtQuestion),
+            BinaryOperator::Question => Ok(Operator::Question),
+            BinaryOperator::QuestionAnd => Ok(Operator::QuestionAnd),
+            BinaryOperator::QuestionPipe => Ok(Operator::QuestionPipe),
             _ => not_impl_err!("unsupported operation: {op:?}"),
         }
     }
@@ -962,6 +1005,17 @@ impl Unparser<'_> {
             Operator::StringConcat => Ok(BinaryOperator::StringConcat),
             Operator::AtArrow => Ok(BinaryOperator::AtArrow),
             Operator::ArrowAt => Ok(BinaryOperator::ArrowAt),
+            Operator::Arrow => Ok(BinaryOperator::Arrow),
+            Operator::LongArrow => Ok(BinaryOperator::LongArrow),
+            Operator::HashArrow => Ok(BinaryOperator::HashArrow),
+            Operator::HashLongArrow => Ok(BinaryOperator::HashLongArrow),
+            Operator::AtAt => Ok(BinaryOperator::AtAt),
+            Operator::IntegerDivide => Ok(BinaryOperator::DuckIntegerDivide),
+            Operator::HashMinus => Ok(BinaryOperator::HashMinus),
+            Operator::AtQuestion => Ok(BinaryOperator::AtQuestion),
+            Operator::Question => Ok(BinaryOperator::Question),
+            Operator::QuestionAnd => Ok(BinaryOperator::QuestionAnd),
+            Operator::QuestionPipe => Ok(BinaryOperator::QuestionPipe),
         }
     }
 
@@ -1079,16 +1133,16 @@ impl Unparser<'_> {
             ScalarValue::Float16(None) => Ok(ast::Expr::value(ast::Value::Null)),
             ScalarValue::Float32(Some(f)) => {
                 let f_val = match f.fract() {
-                    0.0 => format!("{:.1}", f),
-                    _ => format!("{}", f),
+                    0.0 => format!("{f:.1}"),
+                    _ => format!("{f}"),
                 };
                 Ok(ast::Expr::value(ast::Value::Number(f_val, false)))
             }
             ScalarValue::Float32(None) => Ok(ast::Expr::value(ast::Value::Null)),
             ScalarValue::Float64(Some(f)) => {
                 let f_val = match f.fract() {
-                    0.0 => format!("{:.1}", f),
-                    _ => format!("{}", f),
+                    0.0 => format!("{f:.1}"),
+                    _ => format!("{f}"),
                 };
                 Ok(ast::Expr::value(ast::Value::Number(f_val, false)))
             }
@@ -1665,6 +1719,7 @@ mod tests {
     use std::ops::{Add, Sub};
     use std::{any::Any, sync::Arc, vec};
 
+    use crate::unparser::dialect::SqliteDialect;
     use arrow::array::{LargeListArray, ListArray};
     use arrow::datatypes::{DataType::Int8, Field, Int32Type, Schema, TimeUnit};
     use ast::ObjectName;
@@ -1677,6 +1732,7 @@ mod tests {
         ScalarUDFImpl, Signature, Volatility, WindowFrame, WindowFunctionDefinition,
     };
     use datafusion_expr::{interval_month_day_nano_lit, ExprFunctionExt};
+    use datafusion_functions::datetime::from_unixtime::FromUnixtimeFunc;
     use datafusion_functions::expr_fn::{get_field, named_struct};
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::expr_fn::sum;
@@ -1688,7 +1744,7 @@ mod tests {
 
     use crate::unparser::dialect::{
         CharacterLengthStyle, CustomDialect, CustomDialectBuilder, DateFieldExtractStyle,
-        Dialect, DuckDBDialect, PostgreSqlDialect, ScalarFnToSqlHandler,
+        DefaultDialect, Dialect, DuckDBDialect, PostgreSqlDialect, ScalarFnToSqlHandler,
     };
 
     use super::*;
@@ -1829,9 +1885,19 @@ mod tests {
                     expr: Box::new(col("a")),
                     pattern: Box::new(lit("foo")),
                     escape_char: Some('o'),
-                    case_insensitive: true,
+                    case_insensitive: false,
                 }),
                 r#"a NOT LIKE 'foo' ESCAPE 'o'"#,
+            ),
+            (
+                Expr::Like(Like {
+                    negated: true,
+                    expr: Box::new(col("a")),
+                    pattern: Box::new(lit("foo")),
+                    escape_char: Some('o'),
+                    case_insensitive: true,
+                }),
+                r#"a NOT ILIKE 'foo' ESCAPE 'o'"#,
             ),
             (
                 Expr::SimilarTo(Like {
@@ -2162,7 +2228,7 @@ mod tests {
         for (expr, expected) in tests {
             let ast = expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
 
             assert_eq!(actual, expected);
         }
@@ -2180,7 +2246,7 @@ mod tests {
         let expr = col("a").gt(lit(4));
         let ast = unparser.expr_to_sql(&expr)?;
 
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
 
         let expected = r#"('a' > 4)"#;
         assert_eq!(actual, expected);
@@ -2196,7 +2262,7 @@ mod tests {
         let expr = col("a").gt(lit(4));
         let ast = unparser.expr_to_sql(&expr)?;
 
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
 
         let expected = r#"(a > 4)"#;
         assert_eq!(actual, expected);
@@ -2220,7 +2286,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
 
             let expected = format!(r#"CAST(a AS {identifier})"#);
             assert_eq!(actual, expected);
@@ -2245,7 +2311,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
 
             let expected = format!(r#"CAST(a AS {identifier})"#);
             assert_eq!(actual, expected);
@@ -2267,7 +2333,7 @@ mod tests {
             let unparser = Unparser::new(&dialect);
             let ast = unparser.sort_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
 
             assert_eq!(actual, expected);
         }
@@ -2517,7 +2583,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST(a AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2573,7 +2639,7 @@ mod tests {
             .call(vec![Expr::Literal(ScalarValue::new_utf8(unit)), col("x")]);
 
             let ast = unparser.expr_to_sql(&expr)?;
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
 
             assert_eq!(actual, expected);
         }
@@ -2600,7 +2666,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST(a AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2628,7 +2694,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST(a AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2667,7 +2733,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST(a AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2696,7 +2762,7 @@ mod tests {
             ));
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST('2025-01-31 01:05:49.123' AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2723,7 +2789,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST(a AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2749,7 +2815,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = expected.to_string();
 
             assert_eq!(actual, expected);
@@ -2806,7 +2872,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"round(CAST("a" AS {identifier}), 2)"#);
 
             assert_eq!(actual, expected);
@@ -2848,6 +2914,115 @@ mod tests {
     }
 
     #[test]
+    fn test_from_unixtime() -> Result<()> {
+        let default_dialect: Arc<dyn Dialect> = Arc::new(DefaultDialect {});
+        let sqlite_dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect {});
+
+        for (dialect, expected) in [
+            (default_dialect, "from_unixtime(date_col)"),
+            (sqlite_dialect, "datetime(`date_col`, 'unixepoch')"),
+        ] {
+            let unparser = Unparser::new(dialect.as_ref());
+            let expr = Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(ScalarUDF::from(FromUnixtimeFunc::new())),
+                args: vec![col("date_col")],
+            });
+
+            let ast = unparser.expr_to_sql(&expr)?;
+
+            let actual = ast.to_string();
+            let expected = expected.to_string();
+
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_date_trunc() -> Result<()> {
+        let default_dialect: Arc<dyn Dialect> = Arc::new(DefaultDialect {});
+        let sqlite_dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect {});
+
+        for (dialect, precision, expected) in [
+            (
+                Arc::clone(&default_dialect),
+                "YEAR",
+                "date_trunc('YEAR', date_col)",
+            ),
+            (
+                Arc::clone(&sqlite_dialect),
+                "YEAR",
+                "strftime('%Y', `date_col`)",
+            ),
+            (
+                Arc::clone(&default_dialect),
+                "MONTH",
+                "date_trunc('MONTH', date_col)",
+            ),
+            (
+                Arc::clone(&sqlite_dialect),
+                "MONTH",
+                "strftime('%Y-%m', `date_col`)",
+            ),
+            (
+                Arc::clone(&default_dialect),
+                "DAY",
+                "date_trunc('DAY', date_col)",
+            ),
+            (
+                Arc::clone(&sqlite_dialect),
+                "DAY",
+                "strftime('%Y-%m-%d', `date_col`)",
+            ),
+            (
+                Arc::clone(&default_dialect),
+                "HOUR",
+                "date_trunc('HOUR', date_col)",
+            ),
+            (
+                Arc::clone(&sqlite_dialect),
+                "HOUR",
+                "strftime('%Y-%m-%d %H', `date_col`)",
+            ),
+            (
+                Arc::clone(&default_dialect),
+                "MINUTE",
+                "date_trunc('MINUTE', date_col)",
+            ),
+            (
+                Arc::clone(&sqlite_dialect),
+                "MINUTE",
+                "strftime('%Y-%m-%d %H:%M', `date_col`)",
+            ),
+            (default_dialect, "SECOND", "date_trunc('SECOND', date_col)"),
+            (
+                sqlite_dialect,
+                "SECOND",
+                "strftime('%Y-%m-%d %H:%M:%S', `date_col`)",
+            ),
+        ] {
+            let unparser = Unparser::new(dialect.as_ref());
+            let expr = Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(ScalarUDF::from(
+                    datafusion_functions::datetime::date_trunc::DateTruncFunc::new(),
+                )),
+                args: vec![
+                    Expr::Literal(ScalarValue::Utf8(Some(precision.to_string()))),
+                    col("date_col"),
+                ],
+            });
+
+            let ast = unparser.expr_to_sql(&expr)?;
+
+            let actual = ast.to_string();
+            let expected = expected.to_string();
+
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_dictionary_to_sql() -> Result<()> {
         let dialect = CustomDialectBuilder::new().build();
 
@@ -2877,7 +3052,7 @@ mod tests {
         let expr = cast(col("a"), DataType::Utf8View);
         let ast = unparser.expr_to_sql(&expr)?;
 
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
         let expected = r#"CAST(a AS CHAR)"#.to_string();
 
         assert_eq!(actual, expected);
@@ -2885,7 +3060,7 @@ mod tests {
         let expr = col("a").eq(lit(ScalarValue::Utf8View(Some("hello".to_string()))));
         let ast = unparser.expr_to_sql(&expr)?;
 
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
         let expected = r#"(a = 'hello')"#.to_string();
 
         assert_eq!(actual, expected);
@@ -2893,7 +3068,7 @@ mod tests {
         let expr = col("a").is_not_null();
 
         let ast = unparser.expr_to_sql(&expr)?;
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
         let expected = r#"a IS NOT NULL"#.to_string();
 
         assert_eq!(actual, expected);
@@ -2901,7 +3076,7 @@ mod tests {
         let expr = col("a").is_null();
 
         let ast = unparser.expr_to_sql(&expr)?;
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
         let expected = r#"a IS NULL"#.to_string();
 
         assert_eq!(actual, expected);
