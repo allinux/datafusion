@@ -48,6 +48,8 @@ use object_store::path::Path;
 use rand::distr::SampleString;
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
+use uuid::Uuid;
+
 type RecordBatchReceiver = Receiver<RecordBatch>;
 pub type DemuxedStreamReceiver = UnboundedReceiver<(Path, RecordBatchReceiver)>;
 
@@ -266,7 +268,8 @@ async fn hive_style_partitions_demuxer(
     file_extension: String,
     keep_partition_by_columns: bool,
 ) -> Result<()> {
-    let write_id = rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 16);
+    //let write_id = rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 16);
+    let write_id = Uuid::new_v4().to_string();
 
     let exec_options = &context.session_config().options().execution;
     let max_buffered_recordbatches = exec_options.max_buffered_batches_per_output_file;
